@@ -14,18 +14,25 @@
 package io.trino.client;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.google.common.io.CountingInputStream;
 import jakarta.annotation.Nullable;
 import okhttp3.Call;
+import okhttp3.ConnectionPool;
 import okhttp3.Headers;
 import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import okhttp3.internal.connection.RealConnection;
+import okhttp3.internal.connection.RealConnectionPool;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.reflect.Field;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static com.google.common.base.MoreObjects.toStringHelper;
 import static java.lang.String.format;
@@ -116,11 +123,12 @@ public final class JsonResponse<T>
                 String body = null;
                 T value = null;
                 IllegalArgumentException exception = null;
+                CountingInputStream countingInputStream = new CountingInputStream(responseBody.byteStream());
                 try {
                     if (materializedJsonSizeLimit.isPresent() && (responseBody.contentLength() < 0 || responseBody.contentLength() > materializedJsonSizeLimit.getAsLong())) {
                         // Parse from input stream, response is either of unknown size or too large to materialize. Raw response body
                         // will not be available if parsing fails
-                        value = codec.fromJson(responseBody.byteStream());
+                        value = codec.fromJson(countingInputStream);
                     }
                     else {
                         // parse from materialized response body string
@@ -128,15 +136,22 @@ public final class JsonResponse<T>
                         value = codec.fromJson(body);
                     }
                 }
-                catch (JsonProcessingException e) {
-                    String message;
-                    if (body != null) {
-                        message = format("Unable to create %s from JSON response:\n[%s]", codec.getType(), body);
+                catch (JsonProcessingException z) {
+                    try {
+                        System.err.println(countingInputStream.getCount() + " bytes read from response body stream for request to " + request.url());
+                        System.err.println("catching: " + z.getMessage());
+                        return executeWithRetryLimit(codec, client, request, materializedJsonSizeLimit, 0);
                     }
-                    else {
-                        message = format("Unable to create %s from JSON response", codec.getType());
+                    catch (Exception e) {
+                        String message;
+                        if (body != null) {
+                            message = format("Unable to create %s from JSON response:\n[%s]", codec.getType(), body);
+                        }
+                        else {
+                            message = format("Unable to create %s from JSON response", codec.getType());
+                        }
+                        exception = new IllegalArgumentException(message, e);
                     }
-                    exception = new IllegalArgumentException(message, e);
                 }
                 return new JsonResponse<>(response.code(), response.headers(), body, value, exception);
             }
@@ -144,6 +159,48 @@ public final class JsonResponse<T>
         }
         catch (IOException e) {
             throw new UncheckedIOException(e);
+        }
+    }
+
+    public static <T> JsonResponse<T> executeWithRetryLimit(JsonCodec<T> codec, Call.Factory client, Request request, OptionalLong materializedJsonSizeLimit, int retries)
+    {
+        retries++;
+        System.err.println("Clearing OkHttp connection pool and cache, retry: " + Integer.toString(retries));
+        try {
+            ConnectionPool pool = ((OkHttpClient) client).connectionPool();
+            Field delegateField = pool.getClass().getDeclaredField("delegate");
+            delegateField.setAccessible(true);
+            RealConnectionPool realConnectionPool = (RealConnectionPool) delegateField.get(pool);
+            Field connectionsField = realConnectionPool.getClass().getDeclaredField("connections");
+            connectionsField.setAccessible(true);
+            ConcurrentLinkedQueue<RealConnection> connections = (ConcurrentLinkedQueue<RealConnection>) connectionsField.get(realConnectionPool);
+            for (RealConnection connection : connections) {
+                System.err.println(connection.toString());
+                System.err.println("Healthy: " + connection.isHealthy(false) + ", extensive: " + connection.isHealthy(true));
+                System.err.println(connection.getCalls().size() + " calls associated with connection");
+            }
+
+            ((OkHttpClient) client).connectionPool().evictAll();
+            return execute(codec, client, request, materializedJsonSizeLimit);
+        }
+        catch (UncheckedIOException e) {
+            System.err.println("retry hit UncheckIOException: " + e.getMessage());
+            if (retries <= 5) {
+                return executeWithRetryLimit(codec, client, request, materializedJsonSizeLimit, retries);
+            }
+            else {
+                throw e;
+            }
+        }
+        catch (NoSuchFieldException ex) {
+            throw new RuntimeException(ex);
+        }
+        catch (IllegalAccessException ex) {
+            throw new RuntimeException(ex);
+        }
+        catch (Exception e) {
+            System.err.println("retry hit exception: " + e.getMessage());
+            throw e;
         }
     }
 
