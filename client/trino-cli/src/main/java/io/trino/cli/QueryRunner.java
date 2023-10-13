@@ -18,10 +18,12 @@ import io.trino.client.StatementClient;
 import io.trino.client.uri.TrinoUri;
 import okhttp3.Call;
 import okhttp3.OkHttpClient;
+import okhttp3.Protocol;
 import okhttp3.logging.HttpLoggingInterceptor;
 
 import java.io.Closeable;
 import java.sql.SQLException;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -58,6 +60,7 @@ public class QueryRunner
         }
 
         setupTimeouts(builder, 30, SECONDS);
+        builder.protocols(Arrays.asList(Protocol.HTTP_1_1));
         builder.addNetworkInterceptor(
                 new HttpLoggingInterceptor(System.err::println)
                         .setLevel(networkLogging));
